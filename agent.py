@@ -6,7 +6,8 @@ import os
 import math
 from typing import List, Dict, Optional
 import logging
-from openai import OpenAI
+from transformers import BartForConditionalGeneration, BartTokenizer
+import torch
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -22,22 +23,125 @@ logger = logging.getLogger(__name__)
 
 
 class SynthesisAgent:
-    """Individual agent that synthesizes a document section"""
+    """Individual agent that synthesizes a document section using BART"""
     
-    def __init__(self, api_key: Optional[str] = None, model: str = "gpt-4o-mini"):
+    def __init__(self, model_name: str = "facebook/bart-large-cnn", device: Optional[str] = None):
         """
-        Initialize synthesis agent
+        Initialize synthesis agent with BART model
         
         Args:
-            api_key: OpenAI API key. If None, will try to get from environment variable OPENAI_API_KEY
-            model: OpenAI model to use (default: gpt-4o-mini)
+            model_name: Hugging Face model name (default: facebook/bart-large-cnn)
+            device: Device to run model on ('cuda', 'cpu', or None for auto-detect)
         """
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
-        if not self.api_key:
-            raise ValueError("OpenAI API key is required. Set OPENAI_API_KEY environment variable or pass api_key parameter.")
+        self.model_name = model_name
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         
-        self.client = OpenAI(api_key=self.api_key)
-        self.model = model
+        logger.info(f"Loading BART model: {model_name} on device: {self.device}")
+        try:
+            self.tokenizer = BartTokenizer.from_pretrained(model_name)
+            self.model = BartForConditionalGeneration.from_pretrained(model_name)
+            self.model.to(self.device)
+            self.model.eval()
+            logger.info("BART model loaded successfully")
+        except Exception as e:
+            logger.error(f"Error loading BART model: {e}")
+            raise
+    
+    def _chunk_text_for_bart(self, text: str, max_length: int = 1024) -> List[str]:
+        """
+        Split text into chunks that fit within BART's token limit
+        
+        Args:
+            text: Text to chunk
+            max_length: Maximum token length (BART max is 1024, using 1000 for safety)
+        
+        Returns:
+            List of text chunks
+        """
+        # Tokenize to get accurate length
+        tokens = self.tokenizer.encode(text, add_special_tokens=False)
+        
+        if len(tokens) <= max_length:
+            return [text]
+        
+        chunks = []
+        # Split by sentences first, then by token count
+        sentences = text.split('. ')
+        current_chunk = []
+        current_tokens = []
+        
+        for sentence in sentences:
+            sentence_tokens = self.tokenizer.encode(sentence, add_special_tokens=False)
+            
+            if len(current_tokens) + len(sentence_tokens) <= max_length:
+                current_chunk.append(sentence)
+                current_tokens.extend(sentence_tokens)
+            else:
+                # Save current chunk
+                if current_chunk:
+                    chunks.append('. '.join(current_chunk) + '.')
+                # Start new chunk
+                current_chunk = [sentence]
+                current_tokens = sentence_tokens
+        
+        # Add remaining chunk
+        if current_chunk:
+            chunks.append('. '.join(current_chunk) + '.')
+        
+        return chunks if chunks else [text]
+    
+    def summarize(self, text: str, max_length: int = 142, min_length: int = 56) -> str:
+        """
+        Summarize text using BART
+        
+        Args:
+            text: Text to summarize
+            max_length: Maximum length of summary (in tokens)
+            min_length: Minimum length of summary (in tokens)
+        
+        Returns:
+            Summarized text
+        """
+        try:
+            # BART has a max input of 1024 tokens, so we need to chunk if necessary
+            chunks = self._chunk_text_for_bart(text, max_length=1000)
+            
+            summaries = []
+            for chunk in chunks:
+                inputs = self.tokenizer(
+                    chunk,
+                    max_length=1024,
+                    truncation=True,
+                    padding="max_length",
+                    return_tensors="pt"
+                ).to(self.device)
+                
+                with torch.no_grad():
+                    summary_ids = self.model.generate(
+                        inputs["input_ids"],
+                        max_length=max_length,
+                        min_length=min_length,
+                        length_penalty=2.0,
+                        num_beams=4,
+                        early_stopping=True
+                    )
+                
+                summary = self.tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+                summaries.append(summary)
+            
+            # If multiple chunks, combine summaries
+            if len(summaries) > 1:
+                combined = ' '.join(summaries)
+                # If combined summary is too long, summarize it again
+                if len(self.tokenizer.encode(combined, add_special_tokens=False)) > 1000:
+                    return self.summarize(combined, max_length=max_length, min_length=min_length)
+                return combined
+            
+            return summaries[0] if summaries else ""
+            
+        except Exception as e:
+            logger.error(f"Error in BART summarization: {e}")
+            raise
     
     def synthesize(self, 
                    content: str, 
@@ -48,7 +152,7 @@ class SynthesisAgent:
         Synthesize and summarize a document section
         
         Args:
-            content: The content to synthesize (should be <= 100k characters)
+            content: The content to synthesize (should be within BART's token limit ~1000 tokens)
             previous_context: Summary from previous sections (if any)
             section_number: Current section number (1-indexed)
             total_sections: Total number of sections
@@ -56,51 +160,36 @@ class SynthesisAgent:
         Returns:
             Synthesized summary of the content
         """
-        # Build the prompt
-        if previous_context:
-            prompt = f"""You are a financial news analyst. Your task is to synthesize and summarize the following section of a financial news article.
-
-CONTEXT FROM PREVIOUS SECTIONS:
-{previous_context}
-
-CURRENT SECTION TO ANALYZE (Section {section_number} of {total_sections}):
-{content}
-
-Please provide a comprehensive synthesis that:
-1. Extracts key financial insights and information
-2. Identifies important market movements, price changes, and trends
-3. Highlights significant events, announcements, or data points
-4. Notes any relevant metrics, percentages, or figures
-5. If this is not the first section, integrate the new information with the context from previous sections
-6. Maintains continuity with previous sections while adding new insights
-
-Provide a clear, structured summary that captures the essential information."""
-        else:
-            prompt = f"""You are a financial news analyst. Your task is to synthesize and summarize the following section of a financial news article.
-
-CURRENT SECTION TO ANALYZE (Section {section_number} of {total_sections}):
-{content}
-
-Please provide a comprehensive synthesis that:
-1. Extracts key financial insights and information
-2. Identifies important market movements, price changes, and trends
-3. Highlights significant events, announcements, or data points
-4. Notes any relevant metrics, percentages, or figures
-
-Provide a clear, structured summary that captures the essential information."""
-        
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": "You are an expert financial news analyst specializing in cryptocurrency and financial markets."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.3,
-                max_tokens=2000
-            )
+            # Build input text
+            if previous_context:
+                # Combine previous context with current content
+                # Since BART has token limits (1024), we need to be smart about combining
+                context_tokens = self.tokenizer.encode(previous_context, add_special_tokens=False)
+                content_tokens = self.tokenizer.encode(content, add_special_tokens=False)
+                
+                # If context is too long, summarize it first to preserve space for current content
+                # We want to keep most tokens for the current content
+                max_context_tokens = min(300, 1024 - len(content_tokens) - 50)  # Reserve 50 for separators
+                
+                if len(context_tokens) > max_context_tokens:
+                    # Summarize context to fit within available space
+                    previous_context = self.summarize(
+                        previous_context, 
+                        max_length=max_context_tokens // 2,  # Conservative estimate
+                        min_length=30
+                    )
+                
+                # Combine context and content with clear separator
+                combined_text = f"Context from previous sections: {previous_context}\n\nCurrent section content: {content}"
+            else:
+                combined_text = content
             
-            synthesis = response.choices[0].message.content
+            # Summarize the combined text
+            # Use longer max_length when we have context to capture more information
+            max_summary_length = 250 if previous_context else 200
+            synthesis = self.summarize(combined_text, max_length=max_summary_length, min_length=50)
+            
             logger.info(f"Agent synthesized section {section_number}/{total_sections} ({len(content)} chars -> {len(synthesis)} chars)")
             return synthesis
             
@@ -114,44 +203,104 @@ class OrchestratorAgent:
     
     def __init__(self, 
                  news_api_key: Optional[str] = None,
-                 openai_api_key: Optional[str] = None,
-                 model: str = "gpt-4o-mini"):
+                 model_name: str = "facebook/bart-large-cnn",
+                 device: Optional[str] = None):
         """
         Initialize orchestrator
         
         Args:
             news_api_key: NewsAPI key
-            openai_api_key: OpenAI API key
-            model: OpenAI model to use
+            model_name: Hugging Face BART model name (default: facebook/bart-large-cnn)
+            device: Device to run model on ('cuda', 'cpu', or None for auto-detect)
         """
         self.news_extractor = NewsExtractor(api_key=news_api_key)
-        self.synthesis_agent = SynthesisAgent(api_key=openai_api_key, model=model)
-        self.chunk_size = 100000  # 100k characters per chunk
+        self.synthesis_agent = SynthesisAgent(model_name=model_name, device=device)
+        # BART's max input is 1024 tokens, using 1000 for safety margin
+        self.max_tokens_per_chunk = 1000
     
     def split_document(self, content: str) -> List[str]:
         """
-        Split document into chunks of 100k characters
+        Split document into chunks based on BART's token limit (1024 tokens)
+        Uses BART tokenizer to accurately measure token counts
         
         Args:
             content: Full document content
         
         Returns:
-            List of document chunks
+            List of document chunks, each within BART's token limit
         """
-        if len(content) <= self.chunk_size:
+        tokenizer = self.synthesis_agent.tokenizer
+        
+        # Check if entire document fits within token limit
+        full_tokens = tokenizer.encode(content, add_special_tokens=False)
+        if len(full_tokens) <= self.max_tokens_per_chunk:
+            logger.info(f"Document fits in single chunk ({len(full_tokens)} tokens, {len(content)} chars)")
             return [content]
         
+        # Split by sentences first to avoid breaking sentences
+        sentences = content.split('. ')
         chunks = []
-        num_chunks = math.ceil(len(content) / self.chunk_size)
+        current_chunk = []
+        current_tokens = []
         
-        for i in range(num_chunks):
-            start_idx = i * self.chunk_size
-            end_idx = min((i + 1) * self.chunk_size, len(content))
-            chunk = content[start_idx:end_idx]
-            chunks.append(chunk)
+        for sentence in sentences:
+            # Add period back if it's not the last sentence
+            sentence_with_period = sentence if sentence.endswith('.') else sentence + '.'
+            sentence_tokens = tokenizer.encode(sentence_with_period, add_special_tokens=False)
+            
+            # Check if adding this sentence would exceed token limit
+            if len(current_tokens) + len(sentence_tokens) <= self.max_tokens_per_chunk:
+                # Add sentence to current chunk
+                current_chunk.append(sentence_with_period)
+                current_tokens.extend(sentence_tokens)
+            else:
+                # Save current chunk if it has content
+                if current_chunk:
+                    chunk_text = ' '.join(current_chunk)
+                    chunks.append(chunk_text)
+                    logger.debug(f"Created chunk {len(chunks)}: {len(tokenizer.encode(chunk_text, add_special_tokens=False))} tokens")
+                
+                # If single sentence exceeds limit, we need to split it further
+                if len(sentence_tokens) > self.max_tokens_per_chunk:
+                    # Split long sentence by words
+                    words = sentence_with_period.split(' ')
+                    current_chunk = []
+                    current_tokens = []
+                    
+                    for word in words:
+                        word_tokens = tokenizer.encode(word + ' ', add_special_tokens=False)
+                        if len(current_tokens) + len(word_tokens) <= self.max_tokens_per_chunk:
+                            current_chunk.append(word)
+                            current_tokens.extend(word_tokens)
+                        else:
+                            if current_chunk:
+                                chunk_text = ' '.join(current_chunk)
+                                chunks.append(chunk_text)
+                                logger.debug(f"Created chunk {len(chunks)} from long sentence: {len(tokenizer.encode(chunk_text, add_special_tokens=False))} tokens")
+                            current_chunk = [word]
+                            current_tokens = word_tokens
+                else:
+                    # Start new chunk with this sentence
+                    current_chunk = [sentence_with_period]
+                    current_tokens = sentence_tokens
         
-        logger.info(f"Split document into {len(chunks)} chunks ({len(content)} total characters)")
-        return chunks
+        # Add remaining chunk
+        if current_chunk:
+            chunk_text = ' '.join(current_chunk)
+            chunks.append(chunk_text)
+            logger.debug(f"Created final chunk {len(chunks)}: {len(tokenizer.encode(chunk_text, add_special_tokens=False))} tokens")
+        
+        # Verify all chunks are within token limit
+        for i, chunk in enumerate(chunks, 1):
+            chunk_tokens = tokenizer.encode(chunk, add_special_tokens=False)
+            if len(chunk_tokens) > self.max_tokens_per_chunk:
+                logger.warning(f"Chunk {i} exceeds token limit: {len(chunk_tokens)} tokens (max: {self.max_tokens_per_chunk})")
+        
+        total_tokens = sum(len(tokenizer.encode(chunk, add_special_tokens=False)) for chunk in chunks)
+        logger.info(f"Split document into {len(chunks)} chunks based on BART token limit ({self.max_tokens_per_chunk} tokens/chunk)")
+        logger.info(f"Total: {len(content)} chars -> {total_tokens} tokens across {len(chunks)} chunks")
+        
+        return chunks if chunks else [content]
     
     def synthesize_document(self, content: str) -> str:
         """
@@ -196,42 +345,37 @@ class OrchestratorAgent:
             # Combine all previous syntheses as context
             previous_context = "\n\n".join(all_syntheses)
         
-        # Final synthesis combining all sections
+        # Final synthesis combining all sections using BART
         logger.info("Creating final synthesis from all sections")
-        final_prompt = f"""You are a financial news analyst. Below are synthesized summaries from different sections of a financial news article. 
-
-Please create a comprehensive final synthesis that:
-1. Integrates all the key insights from each section
-2. Eliminates redundancy while preserving all important information
-3. Maintains a logical flow and structure
-4. Highlights the most critical financial information, market movements, and insights
-5. Provides a clear, concise summary suitable for decision-making
-
-SECTION SUMMARIES:
-{previous_context}
-
-Provide the final comprehensive synthesis:"""
         
         try:
-            response = self.synthesis_agent.client.chat.completions.create(
-                model=self.synthesis_agent.model,
-                messages=[
-                    {"role": "system", "content": "You are an expert financial news analyst specializing in cryptocurrency and financial markets."},
-                    {"role": "user", "content": final_prompt}
-                ],
-                temperature=0.3,
-                max_tokens=3000
+            # Use BART to summarize all section summaries
+            # Structure the summaries with clear section markers
+            structured_summaries = "\n\n".join([
+                f"Section {i+1} Summary: {summary}" 
+                for i, summary in enumerate(all_syntheses)
+            ])
+            
+            # Summarize the combined summaries
+            # Use longer max_length for final synthesis to capture more information
+            final_synthesis = self.synthesis_agent.summarize(
+                structured_summaries,
+                max_length=300,  # Longer summary for final output
+                min_length=100
             )
             
-            final_synthesis = response.choices[0].message.content
             logger.info(f"Final synthesis complete ({len(final_synthesis)} characters)")
             return final_synthesis
             
         except Exception as e:
             logger.error(f"Error creating final synthesis: {e}")
-            # Fallback: return concatenated syntheses
-            logger.warning("Falling back to concatenated syntheses")
-            return previous_context
+            # Fallback: return concatenated syntheses with structure
+            logger.warning("Falling back to structured concatenated syntheses")
+            structured_fallback = "\n\n".join([
+                f"Section {i+1}:\n{summary}\n" 
+                for i, summary in enumerate(all_syntheses)
+            ])
+            return structured_fallback
     
     def process_article(self, article: Dict) -> Dict:
         """
@@ -326,12 +470,13 @@ def main():
     parser.add_argument("--from-date", type=str, default=None, help="Date in YYYY-MM-DD format (default: yesterday)")
     parser.add_argument("--sort-by", type=str, default="popularity", choices=["popularity", "relevancy", "publishedAt"], help="Sort order")
     parser.add_argument("--page-size", type=int, default=5, help="Number of articles to process (default: 5)")
-    parser.add_argument("--model", type=str, default="gpt-4o-mini", help="OpenAI model to use (default: gpt-4o-mini)")
+    parser.add_argument("--model", type=str, default="facebook/bart-large-cnn", help="Hugging Face BART model name (default: facebook/bart-large-cnn)")
+    parser.add_argument("--device", type=str, default=None, choices=["cuda", "cpu"], help="Device to run model on (default: auto-detect)")
     
     args = parser.parse_args()
     
     # Initialize orchestrator
-    orchestrator = OrchestratorAgent(model=args.model)
+    orchestrator = OrchestratorAgent(model_name=args.model, device=args.device)
     
     # Process news
     articles = orchestrator.process_news_query(

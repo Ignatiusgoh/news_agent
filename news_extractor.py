@@ -151,4 +151,5 @@ if __name__ == "__main__":
         print(f"URL: {article['url']}")
         print(f"Content length: {len(article['content'])} characters")
         print(f"{'='*80}\n")
+        print(f"{article['content'][:1000]}")
 
