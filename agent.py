@@ -7,6 +7,9 @@ import math
 from typing import List, Dict, Optional
 import logging
 from openai import OpenAI
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Handle both relative and absolute imports
 try:

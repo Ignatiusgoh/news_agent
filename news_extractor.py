@@ -8,9 +8,13 @@ from datetime import datetime, timedelta
 from newsapi import NewsApiClient
 from newspaper import Article
 import logging
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 
 
 class NewsExtractor:
